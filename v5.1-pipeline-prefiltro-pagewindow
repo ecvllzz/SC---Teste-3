@@ -1,0 +1,258 @@
+*** INÍCIO DO PATCH (salve como v5.1.patch) ***
+diff --git a/src/supercadernos/pdfio.py b/src/supercadernos/pdfio.py
+index 1111111..2222222 100644
+--- a/src/supercadernos/pdfio.py
++++ b/src/supercadernos/pdfio.py
+@@ -1,27 +1,82 @@
+ from __future__ import annotations
++from typing import List
+ 
+-def extract_text(path: str) -> str:
+-    """Extrai texto de um PDF. Tenta PyMuPDF; se indisponível, usa pypdf.
+-    Retorna sempre string (pode ser vazia)."""
+-    text = ""
+-    try:
+-        import fitz  # PyMuPDF
+-        with fitz.open(path) as doc:
+-            for page in doc:
+-                text += page.get_text("text")
+-        return text or ""
+-    except Exception:
+-        pass
+-
+-    try:
+-        from pypdf import PdfReader
+-        reader = PdfReader(path)
+-        for page in reader.pages:
+-            text += page.extract_text() or ""
+-        return text or ""
+-    except Exception:
+-        return ""
++def extract_text(path: str) -> str:
++    """Extrai todo o texto do PDF (string única)."""
++    try:
++        import fitz  # PyMuPDF
++        text = ""
++        with fitz.open(path) as doc:
++            for page in doc:
++                text += page.get_text("text")
++        return text or ""
++    except Exception:
++        pass
++    try:
++        from pypdf import PdfReader
++        text = ""
++        reader = PdfReader(path)
++        for page in reader.pages:
++            text += page.extract_text() or ""
++        return text or ""
++    except Exception:
++        return ""
++
++def extract_text_by_page(path: str) -> List[str]:
++    """Extrai o texto **página a página**. Ideal para janela por página."""
++    pages = []
++    try:
++        import fitz
++        with fitz.open(path) as doc:
++            for i in range(len(doc)):
++                pages.append(doc[i].get_text("text") or "")
++        return pages
++    except Exception:
++        pass
++    try:
++        from pypdf import PdfReader
++        reader = PdfReader(path)
++        for page in reader.pages:
++            pages.append(page.extract_text() or "")
++        return pages
++    except Exception:
++        return pages
+diff --git a/src/supercadernos/pipeline.py b/src/supercadernos/pipeline.py
+index 3333333..4444444 100644
+--- a/src/supercadernos/pipeline.py
++++ b/src/supercadernos/pipeline.py
+@@ -1,20 +1,30 @@
+ from __future__ import annotations
+-import os, json, logging
+-from typing import List, Dict, Any
++import os, json, logging, concurrent.futures
++from typing import List, Dict, Any, Tuple
+ from .config import Config
+-from .utils import ensure_dir, write_json, read_json, now_iso
++from .utils import write_json, read_json
+ from .indexer import discover_pdfs, choose_principal, build_run_inputs, parse_principal_structure, enrich_index_with_complements
+-from .pdfio import extract_text
+-from .extractor import prefilter
++from .pdfio import extract_text, extract_text_by_page
++from .extractor import prefilter
+ from .llm import extract_topic_with_llm, consolidate_with_llm, synopsis_with_llm
+@@
+ class Pipeline:
+@@
+-    def prefilter_pairs(self) -> Dict[str, List[str]]:
+-        min_hits = 2 if self.args.economy else self.cfg.limits.min_hits_prefilter
+-        all_topics: List[str] = []
++    def _collect_topics(self) -> List[str]:
++        all_topics: List[str] = []
+         for item in self.master_index.get("conteudo", []):
+             all_topics.append(item.get("topico",""))
+             for st in item.get("subtopicos", []):
+-                if isinstance(st, str):
+-                    all_topics.append(st)
+-                else:
+-                    all_topics.append(st.get("topico", ""))
+-        all_topics = [t for t in all_topics if t]
++                all_topics.append(st if isinstance(st, str) else st.get("topico",""))
++        return [t for t in all_topics if t]
++
++    def prefilter_pairs(self) -> Dict[str, List[str]]:
++        """Prefiltro agora mapeia **páginas candidatas** por tópico (janela por página)."""
++        min_hits = 2 if self.args.economy else self.cfg.limits.min_hits_prefilter
++        window = max(0, int(self.cfg.limits.window_pages))
++        all_topics = self._collect_topics()
+         coverage: Dict[str, List[str]] = {}
++        self._candidates: Dict[str, Dict[str, List[int]]] = {}  # doc -> topic -> page_idxs
++        self._doc_pages_cache: Dict[str, List[str]] = {}
+         for p in self.pdfs:
+-            text = extract_text(p).lower()
++            pages = extract_text_by_page(p)
++            self._doc_pages_cache[os.path.basename(p)] = pages
++            text_all = "\n".join(pages).lower()
+             hits: List[str] = []
+             for t in all_topics:
+-                if prefilter(text, t, min_hits=min_hits):
+-                    hits.append(t)
++                if prefilter(text_all, t, min_hits=min_hits):
++                    # localizar páginas com a palavra-chave; expandir com janela
++                    idxs = []
++                    for i, pg in enumerate(pages):
++                        if prefilter(pg, t, min_hits=1):
++                            idxs.append(i)
++                    # janela |i-window, i+window|
++                    expanded = sorted(set(j for i in idxs for j in range(max(0,i-window), min(len(pages), i+window+1))))
++                    if expanded:
++                        hits.append(t)
++                        self._candidates.setdefault(os.path.basename(p), {})[t] = expanded
+             coverage[os.path.basename(p)] = hits
+         self.coverage = coverage
+         return coverage
+@@
+-    def extract_all(self) -> None:
++    def _build_chunk_for(self, doc_name: str, topic: str, max_chars: int = 6000) -> str:
++        """Monta o chunk unindo páginas candidatas do doc para o tópico."""
++        pages = self._doc_pages_cache.get(doc_name) or []
++        idxs = (self._candidates.get(doc_name, {}).get(topic, [])) if hasattr(self, "_candidates") else []
++        if not pages or not idxs:
++            # fallback: primeiras N chars do doc inteiro
++            return (extract_text(next(p for p in self.pdfs if os.path.basename(p)==doc_name))[:max_chars])
++        joined = "\n".join(pages[i] for i in idxs)
++        return joined[:max_chars]
++
++    def _extract_one(self, doc_name: str, topic: str) -> Tuple[str,str,str]:
++        """Retorna (topic, doc_name, snippet_ou_vazio)."""
++        chunk = self._build_chunk_for(doc_name, topic, max_chars=6000)
++        snippet = extract_topic_with_llm(
++            topic=topic,
++            text_chunk=chunk,
++            model_name=self.cfg.models["flash"].name,
++            temperature=(0.0 if self.args.deterministic else self.cfg.models["flash"].temperature),
++            safety=self.args.safety or self.cfg.models["flash"].safety,
++        )
++        return topic, doc_name, (snippet.strip() if snippet else "")
++
++    def extract_all(self) -> None:
+         if os.path.exists(self.conteudo_por_topico_path) and self.args.resume:
+             try:
+                 self.conteudo_map = read_json(self.conteudo_por_topico_path)
+             except Exception:
+                 self.conteudo_map = {}
+-        topics: List[str] = []
+-        for item in self.master_index.get("conteudo", []):
+-            topics.append(item.get("topico",""))
+-            for st in item.get("subtopicos", []):
+-                topics.append(st if isinstance(st, str) else st.get("topico",""))
+-        topics = [t for t in topics if t]
++        topics = self._collect_topics()
+         for t in topics:
+             self.conteudo_map.setdefault(t, [])
+-        max_calls = self.args.max_calls or self.cfg.limits.max_calls
+-        made_calls = 0
+-        for doc_name, hit_topics in self.coverage.items():
+-            path = next((p for p in self.pdfs if os.path.basename(p)==doc_name), None)
+-            if not path: 
+-                continue
+-            text = extract_text(path)
+-            for topic in hit_topics:
+-                already = any(doc_name in s for s in self.conteudo_map.get(topic, []))
+-                if already:
+-                    continue
+-                if max_calls is not None and made_calls >= max_calls:
+-                    log.warning("max_calls atingido; parando extrações.")
+-                    break
+-                chunk = _make_simple_chunk(text, topic, max_chars=6000)
+-                snippet = extract_topic_with_llm(
+-                    topic=topic,
+-                    text_chunk=chunk,
+-                    model_name=self.cfg.models["flash"].name,
+-                    temperature=(0.0 if self.args.deterministic else self.cfg.models["flash"].temperature),
+-                    safety=self.args.safety or self.cfg.models["flash"].safety,
+-                )
+-                made_calls += 1
+-                if snippet:
+-                    self.conteudo_map[topic].append(f"{snippet.strip()} (fonte: {doc_name})")
+-            write_json(self.conteudo_por_topico_path, self.conteudo_map)
++        max_calls = self.args.max_calls or self.cfg.limits.max_calls
++        pool = concurrent.futures.ThreadPoolExecutor(max_workers=(self.args.max_workers_llm or self.cfg.limits.max_workers_llm or 4))
++        futures = []
++        call_budget = [0]
++        for doc_name, hit_topics in self.coverage.items():
++            for topic in hit_topics:
++                if any(doc_name in s for s in self.conteudo_map.get(topic, [])):
++                    continue
++                if (max_calls is not None) and (call_budget[0] >= max_calls):
++                    break
++                futures.append(pool.submit(self._extract_one, doc_name, topic))
++                call_budget[0] += 1
++        for fut in concurrent.futures.as_completed(futures):
++            topic, doc_name, snippet = fut.result()
++            if snippet:
++                self.conteudo_map[topic].append(f"{snippet} (fonte: {doc_name})")
++        write_json(self.conteudo_por_topico_path, self.conteudo_map)
+@@
+-def _make_simple_chunk(text: str, topic: str, max_chars: int = 6000) -> str:
+-    if not text:
+-        return ""
+-    t = topic.split()[0].lower()
+-    i = text.lower().find(t)
+-    if i == -1:
+-        return text[:max_chars]
+-    half = max_chars // 2
+-    start = max(i - half, 0)
+-    end = min(i + half, len(text))
+-    return text[start:end]
++# função antiga removida (substituída por _build_chunk_for baseado em páginas)
+diff --git a/src/supercadernos/cli.py b/src/supercadernos/cli.py
+index 5555555..6666666 100644
+--- a/src/supercadernos/cli.py
++++ b/src/supercadernos/cli.py
+@@ -8,6 +8,7 @@ from .pipeline import Pipeline
+ def run_pipeline_cmd(args: argparse.Namespace) -> int:
+     level = getattr(logging, (args.log_level or "INFO").upper(), logging.INFO)
+     logging.basicConfig(level=level,
+                         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+                         handlers=[logging.StreamHandler(sys.stdout)])
+     if args.log_file:
+         fh = logging.FileHandler(args.log_file, encoding="utf-8")
+         fh.setLevel(level)
+         fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+         logging.getLogger().addHandler(fh)
+@@ -47,6 +48,7 @@ def main():
+     run.add_argument("--max-calls", type=int, default=None)
+     run.add_argument("--max-workers-llm", type=int, default=None)
+     run.add_argument("--strict", action="store_true")
+     run.add_argument("--add-summary-header", action="store_true")
+     run.add_argument("--resume", action="store_true")
+     run.add_argument("--dry-run", action="store_true")
+     run.set_defaults(func=run_pipeline_cmd)
+*** FIM DO PATCH ***
